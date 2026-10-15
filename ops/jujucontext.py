@@ -114,6 +114,13 @@ class JujuContext:
     For example 'all' (from ``JUJU_DEBUG_AT``).
     """
 
+    hook_reissued: bool = False
+    """Whether Juju reissued this hook after native deferral.
+
+    True when ``JUJU_HOOK_REISSUED=1``. This identifies a new hook invocation,
+    rather than an Ops deferred event being replayed.
+    """
+
     machine_id: str | None = None
     """The ID of the machine.
 
@@ -254,6 +261,7 @@ class JujuContext:
             ),
             dispatch_path=env.get('JUJU_DISPATCH_PATH', ''),
             hook_name=env.get('JUJU_HOOK_NAME', ''),
+            hook_reissued=env.get('JUJU_HOOK_REISSUED') == '1',
             machine_id=env.get('JUJU_MACHINE_ID') or None,
             model_name=env.get('JUJU_MODEL_NAME', ''),
             model_uuid=env.get('JUJU_MODEL_UUID', ''),

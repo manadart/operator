@@ -27,13 +27,13 @@ import sys
 import types
 import typing
 import weakref
-from collections.abc import Callable, Hashable, Iterable
+from collections.abc import Callable, Generator, Hashable, Iterable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, TypeVar
 
 import opentelemetry.trace
 
-from . import charm
+from . import charm, hookcmds
 from ._private import tracer
 from .model import Model, _ModelBackend
 from .storage import JujuStorage, NoSnapshotError, SQLiteStorage
@@ -231,6 +231,8 @@ class EventBase:
         3. At some future time, event C happens, which also checks if A can
            proceed.
         """
+        if self.framework is not None:
+            self.framework._record_event_deferral()
         logger.debug('Deferring %s.', self)
         self.deferred = True
 
@@ -605,6 +607,10 @@ class Framework(Object):
         self._event_name = event_name
         self.meta = meta
         self.model = model
+        self._hook_reissued = model._backend._juju_context.hook_reissued if model else False
+        self._hook_deferred = False
+        self._hook_event_deferred = False
+        self._event_stack: list[tuple[EventBase, bool]] = []
         self.skip_duplicate_events = skip_duplicate_events
         # [(observer_path, method_name, parent_path, event_key)]
         self._observers: _ObserverPath = []
@@ -642,6 +648,69 @@ class Framework(Object):
         # example tempo's charm_tracing) replace the instance's close with a
         # wrapper that is not safe to invoke twice.
         self._closed: bool = False
+
+    @property
+    def hook_deferred(self) -> bool:
+        """Whether :meth:`defer_hook` requested native deferral in this invocation.
+
+        Other observers can use this to avoid starting work while the current
+        hook is waiting for another invocation. It resets for each invocation
+        and does not track direct calls to :func:`ops.hookcmds.hook_defer`.
+        """
+        return self._hook_deferred
+
+    def defer_hook(self) -> None:
+        """Ask Juju to commit this invocation and dispatch the same hook next.
+
+        This experimental API requires a Juju agent providing ``hook-defer``.
+        It returns normally: return from your handler afterwards, allowing other
+        observers, status evaluation, and framework state commit to finish.
+        Juju only commits and reissues the hook if this invocation succeeds.
+
+        The next invocation has a fresh context and emits the current hook to
+        its observers. Previously deferred Ops events stay queued until a normal
+        invocation. Repeated calls request only one further invocation, and no
+        Ops deferred-event notice is added.
+
+        Call this from the current Juju hook handler or a custom event it emits
+        synchronously. Do not combine it with :meth:`EventBase.defer` while
+        handling that hook, or with a reboot request. It does not fall back to
+        Ops event deferral on older Juju agents.
+
+        Raises:
+            RuntimeError: If called outside the current Juju hook handler, from
+                a replayed event, in a restricted context, after Ops event
+                deferral, or when the hook command is unavailable.
+            ops.hookcmds.Error: If Juju rejects the request.
+        """
+        if not self._handling_juju_hook():
+            raise RuntimeError('defer_hook() requires a current, unrestricted Juju hook handler')
+        if self._hook_event_deferred:
+            raise RuntimeError('Cannot combine defer_hook() and event.defer() in the same hook')
+        if not self._hook_deferred:
+            hookcmds.hook_defer()
+            self._hook_deferred = True
+
+    def _handling_juju_hook(self) -> bool:
+        if not self.model or not self._event_stack:
+            return False
+        context = self.model._backend._juju_context
+        if not context.hook_name or context.action_name or context.hook_name == 'collect-metrics':
+            return False
+        event, _ = self._event_stack[0]
+        return (
+            isinstance(event, charm.HookEvent)
+            and event.handle.kind == context.hook_name.replace('-', '_')
+            and not any(deferred for _, deferred in self._event_stack)
+        )
+
+    def _record_event_deferral(self) -> None:
+        if self._handling_juju_hook():
+            if self._hook_deferred:
+                raise RuntimeError(
+                    'Cannot combine event.defer() and defer_hook() in the same hook'
+                )
+            self._hook_event_deferred = True
 
     def set_breakpointhook(self) -> Any | None:
         """Hook into ``sys.breakpointhook`` so the builtin ``breakpoint()`` works as expected.
@@ -870,8 +939,13 @@ class Framework(Object):
                 continue
             if event_kind_ and event_kind_ != event_kind:
                 continue
-            if self.skip_duplicate_events and self._event_is_in_storage(
-                observer_path, method_name, event_path, this_event_data
+            # Saved notices must not suppress the fresh native hook or its custom events.
+            if (
+                self.skip_duplicate_events
+                and not self._hook_reissued
+                and self._event_is_in_storage(
+                    observer_path, method_name, event_path, this_event_data
+                )
             ):
                 logger.info(
                     'Skipping notice (%s/%s/%s) - already in the queue.',
@@ -910,11 +984,18 @@ class Framework(Object):
         notified again. Observers that asked to be notified about events after it's
         been first emitted won't be notified, as that would mean potentially observing
         events out of order.
+
+        During native hook redispatch, or after :meth:`defer_hook` requests it,
+        saved events remain queued until the next normal invocation.
         """
+        if self._hook_reissued or self._hook_deferred:
+            return
         self._reemit()
 
     @contextmanager
-    def _event_context(self, event_name: str, *, deferred: bool = False):
+    def _event_context(
+        self, event_name: str, *, deferred: bool = False, event: EventBase | None = None
+    ) -> Generator[None]:
         """Handles toggling the hook-is-running and event-is-deferred state in backends.
 
         This allows e.g. harness logic to know if it is executing within a running hook context
@@ -948,9 +1029,13 @@ class Framework(Object):
         old_event_is_deferred = backend._event_is_deferred
         backend._hook_is_running = event_name
         backend._event_is_deferred = deferred
+        if event is not None:
+            self._event_stack.append((event, deferred))
         try:
             yield
         finally:
+            if event is not None:
+                self._event_stack.pop()
             backend._hook_is_running = old_hook_is_running
             backend._event_is_deferred = old_event_is_deferred
             self._event_name = old_event_name
@@ -1017,7 +1102,7 @@ class Framework(Object):
                         span.set_attribute('event_name', event_handle.kind)
                         span.set_attribute('handler', f'{observer_path}.{method_name}')
                         with self._event_context(
-                            event_handle.kind, deferred=single_event_path is None
+                            event_handle.kind, deferred=single_event_path is None, event=event
                         ):
                             if (
                                 event_is_from_juju or event_is_action

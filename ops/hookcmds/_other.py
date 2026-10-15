@@ -97,6 +97,30 @@ def goal_state() -> GoalState:
     return GoalState._from_dict(result)
 
 
+def hook_defer() -> None:
+    """Ask Juju to commit this successful hook invocation and run the hook again.
+
+    This experimental command requires a Juju agent with native hook deferral.
+    The command returns normally. The hook must finish successfully before Juju
+    commits its writes and invokes it again with a fresh context. Repeated calls
+    request only one further invocation. Actions and restricted contexts are
+    unsupported, and deferral cannot be combined with a reboot request.
+
+    Charms using Ops should call :meth:`ops.Framework.defer_hook` so the framework
+    can track the request and check that it is valid.
+
+    Raises:
+        RuntimeError: If the Juju agent does not provide ``hook-defer``.
+        Error: If Juju rejects the request.
+    """
+    try:
+        run('hook-defer')
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            'Native hook deferral requires a Juju agent that provides hook-defer'
+        ) from exc
+
+
 def is_leader() -> bool:
     """Obtain the current leadership status for the unit the charm code is executing on.
 
